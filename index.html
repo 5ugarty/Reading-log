@@ -301,6 +301,7 @@ nav{position:sticky;top:0;z-index:100;background:#fff;border-bottom:1px solid #0
     <button class="nav-tab"        data-tab="memo"     onclick="showPage('memo',this)">메모</button>
     <button class="nav-tab"        data-tab="settings" onclick="showPage('settings',this)">설정</button>
   </div>
+  <div id="sync-status" style="margin-left:auto;font-size:11px;color:#888;white-space:nowrap;padding:0 8px;display:flex;align-items:center;gap:4px"></div>
 </nav>
 <div class="tab-band"></div>
 
@@ -391,6 +392,9 @@ nav{position:sticky;top:0;z-index:100;background:#fff;border-bottom:1px solid #0
   <div class="section-header">
     <div class="section-title">설정</div>
     <div class="settings-backup-row">
+      <button class="btn btn-ghost btn-sm" onclick="openGistModal()">☁ GitHub Gist 동기화 설정</button>
+      <button class="btn btn-ghost btn-sm" onclick="gistPush(true)">☁ 지금 업로드</button>
+      <button class="btn btn-ghost btn-sm" onclick="gistPull(true)">☁ 지금 다운로드</button>
       <button class="btn btn-ghost btn-sm" onclick="exportData()">데이터 내보내기</button>
       <button class="btn btn-ghost btn-sm" onclick="document.getElementById('import-file-input').click()">데이터 가져오기</button>
       <input type="file" id="import-file-input" accept="application/json" style="display:none">
@@ -691,6 +695,34 @@ nav{position:sticky;top:0;z-index:100;background:#fff;border-bottom:1px solid #0
   </div>
 </div>
 
+<!-- GIST MODAL -->
+<div class="modal-overlay" id="gist-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">GitHub Gist 동기화</div>
+      <button class="close-btn" onclick="closeModal('gist-modal')">✕</button>
+    </div>
+    <p style="font-size:13px;color:#666;margin-bottom:20px;line-height:1.6">
+      GitHub Personal Access Token(gist 권한)을 입력하면 데이터가 Gist에 자동 저장돼요.<br>
+      어떤 기기/브라우저에서 열어도 동일한 데이터를 쓸 수 있어요.
+    </p>
+    <div class="form-group">
+      <label class="form-label">GitHub Token</label>
+      <input class="form-input" id="gist-token-input" type="password" placeholder="ghp_xxxxxxxxxxxx">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Gist ID <span style="font-weight:400;color:#aaa">(처음이면 비워두세요 — 자동 생성)</span></label>
+      <input class="form-input" id="gist-id-input" placeholder="자동 생성 또는 기존 Gist ID">
+    </div>
+    <div id="gist-modal-status" style="font-size:12px;margin-top:8px;min-height:18px"></div>
+    <div class="form-actions">
+      <button class="btn btn-ghost" onclick="closeModal('gist-modal')">취소</button>
+      <button class="btn btn-ghost" onclick="gistTestAndSave()">연결 테스트</button>
+      <button class="btn btn-primary" onclick="saveGistConfig()">저장</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── DATA ──
 let works   = JSON.parse(localStorage.getItem('wt_works')  || '[]');
@@ -710,13 +742,6 @@ const DEFAULT_SETTINGS = {
 };
 let settings = JSON.parse(localStorage.getItem('wt_settings') || 'null') || JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
 if(!settings.platformColors) settings.platformColors={};
-
-function save() {
-  localStorage.setItem('wt_works',    JSON.stringify(works));
-  localStorage.setItem('wt_cal',      JSON.stringify(calLogs));
-  localStorage.setItem('wt_memos',    JSON.stringify(memos));
-  localStorage.setItem('wt_settings', JSON.stringify(settings));
-}
 
 // collect writers/artists from works data
 function syncWritersArtists() {
@@ -1861,6 +1886,144 @@ function setupImageDrop(dropId, fileInputId, imgId, placeholderId, removeBtnId, 
   });
 }
 
+// ── GIST SYNC ──
+const GIST_FILE = 'webtoon-log-data.json';
+let gistToken  = localStorage.getItem('wt_gist_token')  || '';
+let gistId     = localStorage.getItem('wt_gist_id')     || '';
+let syncPending = false;
+
+function setSyncStatus(msg, color){
+  const el = document.getElementById('sync-status');
+  if(el) el.innerHTML = `<span style="color:${color||'#888'}">${msg}</span>`;
+}
+
+function allDataAsJson(){
+  return JSON.stringify({ works, calLogs, memos, settings, savedAt: new Date().toISOString() });
+}
+
+function loadFromJson(json){
+  const d = JSON.parse(json);
+  if(!d.works) return false;
+  works    = d.works    || [];
+  calLogs  = d.calLogs  || [];
+  memos    = d.memos    || [];
+  settings = d.settings || JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  if(!settings.platformColors) settings.platformColors={};
+  // save to localStorage as cache
+  localStorage.setItem('wt_works',    JSON.stringify(works));
+  localStorage.setItem('wt_cal',      JSON.stringify(calLogs));
+  localStorage.setItem('wt_memos',    JSON.stringify(memos));
+  localStorage.setItem('wt_settings', JSON.stringify(settings));
+  return true;
+}
+
+async function gistPull(manual){
+  if(!gistToken || !gistId) {
+    if(manual) alert('Gist 설정이 없어요. 설정 탭에서 먼저 설정해주세요.');
+    return;
+  }
+  setSyncStatus('☁ 불러오는 중...', '#888');
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      headers:{ 'Authorization':`token ${gistToken}`, 'Accept':'application/vnd.github+json' }
+    });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const fileContent = data.files?.[GIST_FILE]?.content;
+    if(!fileContent) throw new Error('파일 없음');
+    loadFromJson(fileContent);
+    setSyncStatus('☁ 동기화됨', '#3a7a6a');
+    if(manual){
+      renderHome(); renderWorks(); renderCalendar(); renderMemos(); renderMemoSidebar(); renderSettings();
+      alert('최신 데이터를 불러왔어요.');
+    }
+  } catch(e){
+    setSyncStatus('☁ 동기화 실패', '#c05050');
+    if(manual) alert('Gist에서 데이터를 불러오지 못했어요: ' + e.message);
+  }
+}
+
+async function gistPush(manual){
+  if(!gistToken) {
+    if(manual) alert('Gist 설정이 없어요. 설정 탭에서 먼저 설정해주세요.');
+    return;
+  }
+  setSyncStatus('☁ 저장 중...', '#888');
+  try {
+    const body = { files:{ [GIST_FILE]:{ content: allDataAsJson() } } };
+    let res;
+    if(gistId){
+      res = await fetch(`https://api.github.com/gists/${gistId}`, {
+        method:'PATCH',
+        headers:{ 'Authorization':`token ${gistToken}`, 'Content-Type':'application/json', 'Accept':'application/vnd.github+json' },
+        body: JSON.stringify(body)
+      });
+    } else {
+      // create new gist
+      res = await fetch('https://api.github.com/gists', {
+        method:'POST',
+        headers:{ 'Authorization':`token ${gistToken}`, 'Content-Type':'application/json', 'Accept':'application/vnd.github+json' },
+        body: JSON.stringify({ ...body, description:'웹툰 로그 데이터', public:false })
+      });
+      if(res.ok){
+        const d = await res.json();
+        gistId = d.id;
+        localStorage.setItem('wt_gist_id', gistId);
+      }
+    }
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    setSyncStatus('☁ 저장됨', '#3a7a6a');
+    if(manual) alert('Gist에 저장했어요. Gist ID: ' + gistId);
+  } catch(e){
+    setSyncStatus('☁ 저장 실패', '#c05050');
+    if(manual) alert('Gist 저장 실패: ' + e.message);
+  }
+}
+
+// debounced auto-push on every save
+let gistPushTimer = null;
+function save() {
+  localStorage.setItem('wt_works',    JSON.stringify(works));
+  localStorage.setItem('wt_cal',      JSON.stringify(calLogs));
+  localStorage.setItem('wt_memos',    JSON.stringify(memos));
+  localStorage.setItem('wt_settings', JSON.stringify(settings));
+  if(gistToken){
+    clearTimeout(gistPushTimer);
+    setSyncStatus('☁ 대기 중...', '#aaa');
+    gistPushTimer = setTimeout(()=>gistPush(false), 2000);
+  }
+}
+
+// Gist modal
+function openGistModal(){
+  document.getElementById('gist-token-input').value = gistToken;
+  document.getElementById('gist-id-input').value    = gistId;
+  document.getElementById('gist-modal-status').textContent = '';
+  document.getElementById('gist-modal').classList.add('open');
+}
+function saveGistConfig(){
+  gistToken = document.getElementById('gist-token-input').value.trim();
+  gistId    = document.getElementById('gist-id-input').value.trim();
+  localStorage.setItem('wt_gist_token', gistToken);
+  localStorage.setItem('wt_gist_id',    gistId);
+  closeModal('gist-modal');
+  if(gistToken) setSyncStatus('☁ 연결됨', '#3a7a6a');
+}
+async function gistTestAndSave(){
+  const token = document.getElementById('gist-token-input').value.trim();
+  const id    = document.getElementById('gist-id-input').value.trim();
+  const statusEl = document.getElementById('gist-modal-status');
+  statusEl.textContent = '연결 확인 중...'; statusEl.style.color='#888';
+  try {
+    const url = id ? `https://api.github.com/gists/${id}` : 'https://api.github.com/gists?per_page=1';
+    const res = await fetch(url, { headers:{ 'Authorization':`token ${token}`, 'Accept':'application/vnd.github+json' } });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    statusEl.textContent = '✓ 연결 성공!'; statusEl.style.color='#3a7a6a';
+  } catch(e){
+    statusEl.textContent = '✗ 연결 실패: ' + e.message; statusEl.style.color='#c05050';
+  }
+}
+
 // ── INIT ──
 setupImageDrop('cover-drop','cover-file-input','cover-preview','cover-placeholder','cover-remove-btn','input-cover','cover-pick-btn');
 setupImageDrop('char-img-drop','char-img-file-input','char-img-preview','char-img-placeholder','char-img-remove-btn','char-img','char-img-pick-btn');
@@ -1871,6 +2034,16 @@ document.getElementById('import-file-input').addEventListener('change', e=>{
 syncWritersArtists();
 renderHome();
 renderCalendar();
+// auto-pull from Gist on load
+if(gistToken && gistId){
+  setSyncStatus('☁ 불러오는 중...','#888');
+  gistPull(false).then(()=>{
+    syncWritersArtists();
+    renderHome(); renderCalendar();
+  });
+} else if(gistToken){
+  setSyncStatus('☁ Gist ID 없음','#c05050');
+}
 </script>
 
 <!-- CAL LOG EDIT MODAL -->
